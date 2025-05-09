@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const archiver = require('archiver');
 const sharp = require('sharp');
+const ffmpeg = require('fluent-ffmpeg');
 
 const router = express.Router();
 
@@ -85,7 +86,6 @@ router.post('/process-images', async (req, res) => {
         }
     }
 
-    // Create zip
     const zipFilename = `images_${timestamp}.zip`;
     const zipPath = path.join(ZIP_DIR, zipFilename);
     const output = fs.createWriteStream(zipPath);
@@ -103,37 +103,91 @@ router.post('/process-images', async (req, res) => {
     });
 });
 
-// === Video Processing (mock for now) ===
+// === Video Processing Route ===
 router.post('/process-videos', async (req, res) => {
     const files = req.files?.videos;
     const batchSize = parseInt(req.body.batch_size) || 5;
     const intensity = parseInt(req.body.intensity) || 30;
 
-    if (!files || files.length === 0) {
-        return res.status(400).json({ error: 'No videos uploaded' });
+    const opts = {
+        contrast: 'adjust_contrast' in req.body,
+        brightness: 'adjust_brightness' in req.body,
+        rotate: 'rotate' in req.body,
+        crop: 'crop' in req.body,
+        flip: 'flip_horizontal' in req.body
+    };
+
+    if (!files) return res.status(400).json({ error: 'No videos uploaded' });
+
+    const fileArray = Array.isArray(files) ? files : [files];
+    const timestamp = Date.now().toString();
+    const sessionFolder = path.join(PROCESSED_DIR, timestamp);
+    fs.mkdirSync(sessionFolder, { recursive: true });
+
+    for (const file of fileArray) {
+        const baseName = path.parse(file.name).name;
+        const inputPath = path.join(UPLOADS_DIR, file.name);
+        await file.mv(inputPath);
+
+        for (let i = 1; i <= batchSize; i++) {
+            const outName = `${baseName}_variant_${i}.mp4`;
+            const outPath = path.join(sessionFolder, outName);
+            const histPath = path.join(HISTORY_DIR, outName);
+
+            let cmd = ffmpeg(inputPath);
+            const vf = [];
+
+            if (opts.contrast || opts.brightness) {
+                const c = opts.contrast ? 1 + scaleRange(-0.1, 0.1, intensity) : 1;
+                const b = opts.brightness ? scaleRange(-0.1, 0.1, intensity) : 0;
+                vf.push(`eq=contrast=${c}:brightness=${b}`);
+            }
+
+            if (opts.rotate) {
+                const angle = scaleRange(-2, 2, intensity) * (Math.PI / 180);
+                vf.push(`rotate=${angle}`);
+            }
+
+            if (opts.crop) {
+                vf.push(`crop=in_w*0.95:in_h*0.95`);
+            }
+
+            if (opts.flip && Math.random() > 0.5) {
+                vf.push('hflip');
+            }
+
+            if (vf.length) {
+                cmd = cmd.videoFilters(vf.join(','));
+            }
+
+            await new Promise((resolve, reject) => {
+                cmd.outputOptions(['-c:v libx264', '-preset veryfast', '-c:a aac'])
+                    .output(outPath)
+                    .on('end', () => {
+                        fs.copyFileSync(outPath, histPath);
+                        resolve();
+                    })
+                    .on('error', reject)
+                    .run();
+            });
+        }
+
+        fs.unlinkSync(inputPath); // cleanup
     }
 
-    const timestamp = Date.now().toString();
     const zipFilename = `videos_${timestamp}.zip`;
     const zipPath = path.join(ZIP_DIR, zipFilename);
     const output = fs.createWriteStream(zipPath);
     const archive = archiver('zip', { zlib: { level: 9 } });
 
     archive.pipe(output);
-    const fileArray = Array.isArray(files) ? files : [files];
-
-    for (const file of fileArray) {
-        for (let i = 1; i <= batchSize; i++) {
-            const newFilename = `${path.parse(file.name).name}_variant_${i}.mp4`;
-            const savePath = path.join(HISTORY_DIR, newFilename);
-            await file.mv(savePath);
-            archive.file(savePath, { name: newFilename });
-        }
-    }
-
+    fs.readdirSync(sessionFolder).forEach(file => {
+        archive.file(path.join(sessionFolder, file), { name: file });
+    });
     archive.finalize();
 
     output.on('close', () => {
+        fs.rmSync(sessionFolder, { recursive: true });
         res.json({ zip_filename: zipFilename });
     });
 });
